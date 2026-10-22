@@ -1,11 +1,17 @@
 # Created: 2026-06-01 00:00:00
-# Last Modified: 2026-06-03 00:00:00
+# Last Modified: 2026-10-22 00:00:00
 # Description: Python translation of JWST MRS spectral analysis library,
-#   updated to reflect matlab_slice_06032026 changes: make_int_map now adds
-#   rmsmap (per-pixel baseline RMS) and writes a single 12-plane FITS cube
-#   instead of separate intensity/uncertainty 2D maps.
+#   updated to reflect matlab_slice_10222026: new diffSpec (diff_spec here),
+#   catPeaks peaklist columns relabelled Intensity and widened; gaussfit now a
+#   full port (mask, ey, robust).  Earlier, matlab_slice_09102026 (which
+#   includes the 06112026 and 06242026 changes): mkintmap renamed makeMap
+#   (make_map here) and now writes
+#   a 14-plane FITS cube including the continuum at line center and the
+#   Gaussian fit flag; catPeaks takes an optional list of acceptable line
+#   wavelengths in place of the separation threshold; fitLines uses the exact
+#   speed of light; lineID demotes OH lines; plotPeaks argument handling.
 #   Mirrors the Matlab library API as closely as possible.
-# Last Edit: Sync with matlab_slice_06032026: rmsmap field, 12-plane cube FITS output
+# Last Edit: Sync with matlab_slice_10222026
 
 import os
 import sys
@@ -20,9 +26,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# Default catalog directory – catalog files remain in matlab_slice_06012026/
+# Default catalog directory
 _CATDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       '..', 'matlab_slice_06012026')
+                       '..', 'matlab_slice_09102026')
 
 
 # ---------------------------------------------------------------------------
@@ -623,96 +629,250 @@ def sig_chans(xx, yy, noise, snr, thr):
 
 def gaussmfit(x, y, K, S, X0, tol=1e-7, graphout=0):
     """
-    Multi-component Gaussian fit using Levenberg-Marquardt (scipy.optimize).
+    Multiple-component Gaussian fit.
+
+    Direct port of Matlab gaussmfit.m: Levenberg-Marquardt nonlinear fit
+    (Numerical Recipes 14.4) of y = sum_i K_i exp(-(x-X0_i)^2/(2 S_i^2)).
+    The fit stops when the fractional improvement in chi-square from one
+    step to the next is less than tol.
 
     Parameters
     ----------
     x, y : 1-D arrays – independent variable and data
     K, S, X0 : initial guesses for amplitude, sigma, and centre of each component
-    tol : convergence tolerance for curve_fit
-    graphout : unused (kept for API compatibility)
+    tol : fractional chi-square improvement that ends the fit
+    graphout : nonzero plots the data and final model
 
     Returns
     -------
-    Ko, So, X0o : fitted parameters (1-D arrays, length = n_components)
-    chi2   : reduced chi-squared
+    Ko, So, X0o : fitted parameters (1-D arrays, length = n_components);
+                  So is not forced positive (as in Matlab)
+    chi2   : chi-square / (N - 3*n_components)
     ymodel : best-fit model evaluated on x
-    err    : 0 = OK; 1 = did not converge; 4 = ill-conditioned covariance
+    err    : 0 = OK; 1 = L-M lambda exceeded 1000 (best values so far are
+             returned); 4 = badly conditioned L-M matrix
     epar   : parameter uncertainties, length 3*n_components, order [K,S,X0 per comp]
     """
-    K = np.atleast_1d(np.asarray(K, dtype=float))
-    S = np.atleast_1d(np.asarray(S, dtype=float))
-    X0 = np.atleast_1d(np.asarray(X0, dtype=float))
-    n_comp = len(K)
+    x = np.ravel(np.asarray(x, dtype=float))
+    y = np.ravel(np.asarray(y, dtype=float))
+    K = np.atleast_1d(np.asarray(K, dtype=float)).copy()
+    S = np.atleast_1d(np.asarray(S, dtype=float)).copy()
+    X0 = np.atleast_1d(np.asarray(X0, dtype=float)).copy()
+    if not (len(K) == len(S) == len(X0)):
+        raise ValueError('Initial guesses have different dimensions!')
+    b = len(K)
 
-    p0 = np.empty(3 * n_comp)
-    for i in range(n_comp):
-        p0[3*i], p0[3*i+1], p0[3*i+2] = K[i], S[i], X0[i]
+    def components(K, S, X0):
+        return K[:, None] * np.exp(-((x - X0[:, None])**2 / (2 * S[:, None]**2)))
 
-    def multi_gauss(xv, *params):
-        result = np.zeros_like(xv, dtype=float)
-        for ci in range(n_comp):
-            Ki, Si, X0i = params[3*ci], params[3*ci+1], params[3*ci+2]
-            if Si != 0:
-                result += Ki * np.exp(-((xv - X0i)**2) / (2 * Si**2))
-        return result
+    def derivatives(ym, K, S, X0):
+        # rows ordered [dK_1, dS_1, dX0_1, dK_2, ...] as in Matlab
+        dx = x - X0[:, None]
+        J = np.empty((3 * b, len(x)))
+        J[0::3] = ym / K[:, None]
+        J[1::3] = ym * dx**2 / S[:, None]**3
+        J[2::3] = ym * dx / S[:, None]**2
+        return J
 
+    def lm_matrix(J, L):
+        alpha = J @ J.T
+        alpha[np.diag_indices_from(alpha)] *= (1 + L)
+        return alpha
+
+    L = 0.001
     err = 0
-    epar = np.zeros(3 * n_comp)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            popt, pcov = optimize.curve_fit(
-                multi_gauss, x, y, p0=p0,
-                maxfev=50000, ftol=tol, xtol=tol
-            )
-        diag = np.diag(pcov)
-        if np.any(~np.isfinite(diag)):
-            err = 4
-            popt = p0.copy()
-        else:
-            # pcov from curve_fit already contains chi2_red scaling (sigma=None case)
-            epar = np.sqrt(np.abs(diag))
-    except (RuntimeError, optimize.OptimizeWarning):
-        err = 1
-        popt = p0.copy()
+    with np.errstate(all='ignore'):
+        ym = components(K, S, X0)
+        delta = y - ym.sum(axis=0)
+        chi2 = np.sum(delta**2)
+        J = derivatives(ym, K, S, X0)
 
-    Ko = popt[0::3].copy()
-    So = np.abs(popt[1::3]).copy()
-    X0o = popt[2::3].copy()
-    ymodel = multi_gauss(x, *popt)
+        converge = False
+        while not converge:
+            alpha = lm_matrix(J, L)
+            beta = J @ delta
+            # Matlab: if (rcond(alpha)<1e-20), err=4; break; end
+            try:
+                rc = 1.0 / np.linalg.cond(alpha, 1)
+            except np.linalg.LinAlgError:
+                rc = 0.0
+            if not rc >= 1e-20:
+                err = 4
+                break
+            da = np.linalg.solve(alpha, beta)
 
-    residuals = y - ymodel
-    dof = max(len(x) - 3 * n_comp, 1)
-    chi2 = np.sum(residuals**2) / dof
+            newK, newS, newX0 = K + da[0::3], S + da[1::3], X0 + da[2::3]
+            newym = components(newK, newS, newX0)
+            newdelta = y - newym.sum(axis=0)
+            newchi2 = np.sum(newdelta**2)
 
-    if graphout and n_comp > 0:
+            # If chi-square does not improve, increase L as prescribed in
+            # Numerical Recipes; otherwise adopt the new values and decrease L.
+            if not newchi2 < chi2:
+                L *= 10
+                converge = L > 1000
+                if converge:
+                    err = 1
+            else:
+                converge = (chi2 - newchi2) / newchi2 < tol
+                L /= 10
+                K, S, X0 = newK, newS, newX0
+                ym, delta, chi2 = newym, newdelta, newchi2
+                J = derivatives(ym, K, S, X0)
+
+        ymodel = ym.sum(axis=0)
+        chi2 = chi2 / (len(x) - 3 * b)
+
+        # Compute the errors
+        alpha = lm_matrix(J, L)
+        try:
+            emat = np.linalg.inv(alpha)
+            epar = np.sqrt(chi2 * np.abs(np.diag(emat)))
+        except np.linalg.LinAlgError:
+            epar = np.full(3 * b, np.inf)   # Matlab inv of a singular matrix gives Inf
+
+    if graphout:
         plt.figure()
         plt.plot(x, y, 'o', ms=3)
         plt.plot(x, ymodel, '-')
         plt.show()
 
-    return Ko, So, X0o, chi2, ymodel, err, epar
+    return K, S, X0, chi2, ymodel, err, epar
 
 
 def gaussfit(x, y, K=None, S=None, X0=None, tol=1e-4,
              graphout=0, mask=None, ey=None):
     """
-    Single-component Gaussian fit (wrapper around gaussmfit for API parity).
-    Returns Ko, So, X0o, chi2, ymodel, error, epar (each scalar or length-1).
+    Fit a single Gaussian y = K exp(-(x-X0)^2/(2 S^2)).  Port of Matlab gaussfit.m
+    (Levenberg-Marquardt).
+
+    Parameters
+    ----------
+    x, y     : 1-D data arrays
+    K, S, X0 : initial guesses; if K is None reasonable guesses are made
+               (and tol is set to 1e-4)
+    tol      : fractional chi-square improvement that ends the fit.  A
+               negative tol requests a robust fit (sum of |residual|/ey)
+    graphout : >0 plots the result
+    mask     : 3 values, 1 for each parameter (K, S, X0) that is fitted, 0 to
+               keep it fixed at the initial guess (default all fitted)
+    ey       : errors on y (same length as y); the fit is weighted by them
+
+    Returns
+    -------
+    K, S, X0 : fitted parameters (S positive)
+    chi2     : without ey, chi-square/(N - number of fitted parameters)
+               (i.e. RMS^2); with ey, RMS^2 of the residuals
+    ymodel   : best-fit model on x
+    error    : 0 OK; 1 badly conditioned matrix or L exceeded 1000
+    epar     : errors on (K, S, X0); NaN if the matrix was badly conditioned
     """
+    x = np.ravel(np.asarray(x, dtype=float))
+    y = np.ravel(np.asarray(y, dtype=float))
+    mask = np.ones(3) if mask is None else np.ravel(np.asarray(mask, dtype=float))
+    if ey is None or np.size(ey) == 0:
+        ey = np.ones_like(y)
+        noerror = True
+    else:
+        ey = np.ravel(np.asarray(ey, dtype=float))
+        noerror = False
+
     if K is None:
-        K = float(np.max(y))
-        idx = int(np.argmax(y))
-        X0 = float(x[idx])
-        S = float(np.sqrt(np.sum(np.abs(y) * (x - X0)**2) / np.sum(np.abs(y))))
+        ix = int(np.argmax(y))
+        K = y[ix]
+        X0 = x[ix]
+        S = np.sqrt(np.sum(np.abs(y) * (x - X0)**2) / np.sum(np.abs(y)))
         if S > (np.max(x) - np.min(x)) / 10:
             S = (np.max(x) - np.min(x)) / 10
+        tol = 1e-4
+    K, S, X0 = float(K), float(S), float(X0)
+    robust = tol < 0
+    tol = abs(tol)
+    if np.any(mask == 0) and graphout >= 0:
+        print('Constrained Gaussian fit:')
+        if mask[0] == 0: print('\t- Fixed peak amplitude')
+        if mask[1] == 0: print('\t- Fixed width')
+        if mask[2] == 0: print('\t- Fixed center')
+    fit = mask == 1
+    pda = np.zeros(3)
 
-    Ko, So, X0o, chi2, ymodel, err, epar = gaussmfit(
-        x, y, [K], [S], [X0], tol=tol, graphout=graphout
-    )
-    return Ko[0], So[0], X0o[0], chi2, ymodel, err, epar
+    L = 0.001
+    error = 0
+    epar = np.full(3, np.nan)
+    ey2 = ey**2
+
+    def gauss(K, S, X0):
+        return K * np.exp(-((x - X0)**2 / (2 * S**2)))
+
+    def merit(ym):
+        return (np.sum(np.abs((y - ym) / ey)) if robust
+                else np.sum(((y - ym) / ey)**2))
+
+    def derivs(ym, K, S, X0):
+        return np.vstack([ym / K, ym * (x - X0)**2 / S**3, ym * (x - X0) / S**2])
+
+    with np.errstate(all='ignore'):
+        ymodel = gauss(K, S, X0)
+        chi2 = merit(ymodel)
+        D = derivs(ymodel, K, S, X0)
+        beta = D @ ((y - ymodel) / ey2)
+
+        converge = False
+        while not converge:
+            alpha = (D / ey2) @ D.T
+            alpha[np.diag_indices(3)] *= (1 + L)
+            alpha = alpha[np.ix_(fit, fit)]
+            try:
+                rc = 1.0 / np.linalg.cond(alpha, 1)
+            except np.linalg.LinAlgError:
+                rc = np.nan
+            if not rc >= 1e-15:      # Matlab: rc<1e-15 || isnan(rc) -> return
+                return K, S, X0, chi2, ymodel, 1, epar
+            pda[fit] = np.linalg.solve(alpha, beta[fit])
+            newK, newS, newX0 = K + pda[0], S + pda[1], X0 + pda[2]
+            newymodel = gauss(newK, newS, newX0)
+            newchi2 = merit(newymodel)
+
+            if not newchi2 < chi2:
+                L *= 10
+                converge = L > 1000
+                if converge:
+                    error = 1
+                    if graphout >= 0:
+                        print('Exceeding L limit')
+            else:
+                converge = (chi2 - newchi2) / newchi2 < tol
+                L /= 10
+                K, S, X0 = newK, newS, newX0
+                ymodel, chi2 = newymodel, newchi2
+                D = derivs(ymodel, K, S, X0)
+                beta = D @ ((y - ymodel) / ey2)
+        S = abs(S)
+
+        # Reduced chi2
+        nfree = len(ymodel) - np.sum(mask)
+        chi2 = np.sum(((y - ymodel) / ey)**2) / nfree
+        rms = np.sqrt(np.sum((y - ymodel)**2) / nfree)
+
+        alpha = (D / ey2) @ D.T
+        try:
+            emat = np.linalg.inv(alpha)
+        except np.linalg.LinAlgError:
+            emat = np.full((3, 3), np.inf)
+        if noerror:
+            epar = np.sqrt(chi2 * np.abs(np.diag(emat)))
+        else:
+            epar = np.sqrt(np.abs(np.diag(emat)))
+            chi2 = rms**2     # gaussfit has traditionally reported RMS^2
+
+    if graphout > 0:
+        plt.figure()
+        plt.plot(x, y, 'o', ms=3)
+        plt.plot(x, ymodel, '-')
+        plt.title(f'K={K:f}+/-{epar[0]:f}  S={S:f}+/-{epar[1]:f}  '
+                  f'X0={X0:f}+/-{epar[2]:f}')
+
+    return K, S, X0, chi2, ymodel, error, epar
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +881,8 @@ def gaussfit(x, y, K=None, S=None, X0=None, tol=1e-4,
 
 def fit_lines(wv, spec, peaks):
     """
-    Fit Gaussians to detected peaks after continuum subtraction.
+    Fit Gaussians to a list of peaks (wavelength, amplitude) after
+    continuum subtraction.
 
     Parameters
     ----------
@@ -731,11 +892,19 @@ def fit_lines(wv, spec, peaks):
 
     Returns
     -------
-    q      : dict with arrays K, S, X0, area, eK, eS, eX0, earea, flag (length N)
+    q      : dict of arrays (length N) with the results:
+               K     – amplitude (MJy/sr)
+               S     – standard deviation (um)
+               X0    – center wavelength (um)
+               area  – integral (W/m2/sr)
+               eK, eS, eX0, earea – errors in the above
+               flag  – error flag (see cat_peaks for values)
     ymodel : Gaussian model array (same length as wv)
     smo    : filtered pseudo-continuum array (same length as wv)
     """
-    c = 3e8            # m/s
+    c = 2.99792458e8   # speed of light m/s
+    spec = np.ravel(spec)   # accept column- or row-like arrays
+    peaks = np.reshape(np.asarray(peaks, dtype=float), (-1, 2))
     peaklist = peaks[:, 0]
     peakamp = peaks[:, 1]
     nl = len(peaklist)
@@ -787,13 +956,13 @@ def fit_lines(wv, spec, peaks):
     cutoff = 0.005 if np.min(wv) > 4 else 0.25
     B = signal.firwin(forder + 1, cutoff)
     try:
-        smo = signal.filtfilt(B, 1.0, base)
+        smo = signal.filtfilt(B, 1.0, base, padlen=3 * (len(B) - 1))  # Matlab filtfilt padding
     except Exception:
         print('filtfilt failed in fit_lines')
         smo = base.copy()
 
     lines = spec - smo                         # continuum-subtracted spectrum
-    rms = np.std(lines[mask == 0])
+    rms = np.std(lines[mask == 0], ddof=1)   # Matlab std normalizes by N-1
 
     fitreg = 15                                # fit window half-width in channels
     ymodel = np.zeros(len(wv))
@@ -876,7 +1045,7 @@ def fit_lines(wv, spec, peaks):
 # Main cataloguing function
 # ---------------------------------------------------------------------------
 
-def cat_peaks(fname, outname, pixco=0, snr=5, thr=2, nchunk=1):
+def cat_peaks(fname, outname, pixco=0, snr=5, linelist=None, nchunk=1):
     """
     Create a catalog of significant Gaussian peaks for a spectrum extracted
     from a JWST datacube.
@@ -894,8 +1063,14 @@ def cat_peaks(fname, outname, pixco=0, snr=5, thr=2, nchunk=1):
     outname : str – base name for output files (may include path)
     pixco   : extraction region (see extract_aperture); default 0 = whole cube
     snr     : minimum S/N for peak detection (default 5)
-    thr     : minimum channel separation between peaks (default 2)
+    linelist: optional approximate wavelengths (um) of the acceptable lines
+              (default None = accept all peaks).  Detected peaks are kept
+              only if within +/-0.05% of one of them.  If 2-D with two rows,
+              the second row gives the fractional precision for each line.
     nchunk  : number of chunks, or [start_um, end_um] wavelength range
+
+    The minimum channel separation between distinct peaks (sig_chans
+    threshold) is fixed at 2, as in Matlab catPeaks.
 
     Returns
     -------
@@ -912,6 +1087,8 @@ def cat_peaks(fname, outname, pixco=0, snr=5, thr=2, nchunk=1):
         nchunk_val = int(nchunk)
     else:
         nchunk_val = 1
+
+    thr = 2   # threshold separation (in channels) for sig_chans to decide peaks are distinct
 
     # Threshold scale: divide by 1.5 to convert Gaussian sigma to MAD
     snr_scaled = snr / 1.5
@@ -931,9 +1108,22 @@ def cat_peaks(fname, outname, pixco=0, snr=5, thr=2, nchunk=1):
         stw, enw = float(nchunk[0]), float(nchunk[1])
         ix1 = int(np.argmin(np.abs(stw - x)))
         ix2 = int(np.argmin(np.abs(enw - x)))
+        if ix1 == ix2:
+            raise ValueError('The start and end of the region to process in '
+                             'nchunk result in size zero.')
         nchunk_val = 1
     elif nchunk_val > 1:
         chunk = len(y) // nchunk_val
+
+    # Acceptable line wavelengths and fractional precisions
+    lineloc = None
+    if linelist is not None and np.size(linelist) > 0:
+        ll = np.atleast_2d(np.asarray(linelist, dtype=float))
+        lineloc = ll[0, :]
+        if ll.shape[0] == 2:
+            lineprec = ll[1, :]
+        else:
+            lineprec = 0.0005 * np.ones_like(lineloc)
 
     mf = np.array([1, 1, 0, -1, -1], dtype=float)   # matched filter
     pp_all = []
@@ -960,6 +1150,10 @@ def cat_peaks(fname, outname, pixco=0, snr=5, thr=2, nchunk=1):
         scc = np.mean(np.abs(cc - np.mean(cc)))
 
         pp = sig_chans(dx, cc, scc, snr_scaled / 1.5, thr)
+        if lineloc is not None:   # keep only peaks within tolerance of a listed line
+            keep = [np.any((p[0] >= lineloc * (1 - lineprec))
+                           & (p[0] <= lineloc * (1 + lineprec))) for p in pp]
+            pp = pp[np.array(keep, dtype=bool)].reshape(-1, 2)
         nr = len(pp)
         pp_all.append(pp)
 
@@ -1028,24 +1222,30 @@ def cat_peaks(fname, outname, pixco=0, snr=5, thr=2, nchunk=1):
         fp.write(f'% Cube: {os.path.basename(str(fname))}\n')
         fp.write(f'% Region: {region_hdr}\n')
         fp.write('% num wave(um) peak(MJy/sr) GaussK(MJy/sr) GaussFWHM(um) '
-                 'GaussX(um) Flux(W/m2/sr) eGaussK eGaussS eGaussX eFlux flag\n')
+                 'GaussX(um) Intensity(W/m2/sr) eGaussK eGaussS eGaussX '
+                 'eIntensity flag\n')
+        print('% num wave(um) peak(MJy/sr) GaussK(MJy/sr) GaussFWHM(um) '
+              'R(dlam/lam) GaussX(um) Intensity(W/m2/sr) eGaussK eGaussS '
+              'eGaussX eIntensity flag')
         for i in range(np_total):
             q_combined['S'][i] = abs(q_combined['S'][i])
+            K, S, X0 = q_combined['K'][i], q_combined['S'][i], q_combined['X0'][i]
+            area, earea = q_combined['area'][i], q_combined['earea'][i]
+            eK, eS, eX0 = q_combined['eK'][i], q_combined['eS'][i], q_combined['eX0'][i]
+            flg = q_combined['flag'][i]
             fp.write(
                 f'{i+1:3d} {pp_total[i,0]:8.4f} {pp_total[i,1]:12.4f} '
-                f'{q_combined["K"][i]:12.4f} {q_combined["S"][i]*s2f:8.4f} '
-                f'{q_combined["X0"][i]:8.4f} {q_combined["area"][i]:8.4g} '
-                f'{q_combined["eK"][i]:8.4g} {q_combined["eS"][i]*s2f:8.4g} '
-                f'{q_combined["eX0"][i]:8.4g} {q_combined["earea"][i]:8.4g} '
-                f'{q_combined["flag"][i]:2d}\n'
+                f'{K:12.4f} {S*s2f:12.4f} {X0:8.4f} {area:12.4g} '
+                f'{eK:8.4g} {eS*s2f:8.4g} {eX0:8.4g} {earea:8.4g} {flg:2d}\n'
             )
-            status = '*' if q_combined['flag'][i] > 0 else ' '
-            R_val = q_combined['X0'][i] / (q_combined['S'][i] * s2f + 1e-30)
-            print(f'{status}{i+1:3d} {pp_total[i,0]:8.4f} '
-                  f'{pp_total[i,1]:12.4f} {q_combined["K"][i]:12.4f} '
-                  f'{q_combined["S"][i]*s2f:8.4f} {R_val:8.0f} '
-                  f'{q_combined["X0"][i]:8.4f} {q_combined["area"][i]:8.4g} '
-                  f'{q_combined["flag"][i]:2d}')
+            with np.errstate(divide='ignore'):
+                R_val = np.float64(X0) / (S * s2f)
+            # flagged fits go to stderr, as in Matlab (fprintf to fid 2)
+            print(f'{i+1:3d} {pp_total[i,0]:8.4f} {pp_total[i,1]:12.4f} '
+                  f'{K:12.4f} {S*s2f:12.4f} {R_val:8.0f} {X0:12.4f} '
+                  f'{area:8.4g} {eK:8.4g} {eS*s2f:8.4g} {eX0:8.4g} '
+                  f'{earea:8.4g} {flg:2d}',
+                  file=sys.stderr if flg > 0 else sys.stdout)
 
     # Write spectrum
     with open(f'{outname}_spec.txt', 'w') as fp:
@@ -1123,33 +1323,30 @@ def do_lines(fname, pixco, lwave):
 
 
 # ---------------------------------------------------------------------------
-# Parabolic centroid helper  (new in 06022026, used by make_int_map)
+# Parabolic centroid helper  (used by make_map)
 # ---------------------------------------------------------------------------
 
 def _parcenter(xp, yp):
     """
     Parabolic centroid of 3 points.
 
-    Fits a quadratic to (xp, yp).  Returns (x_peak, y_peak) at the vertex.
-    If the parabola opens upward (minimum, not maximum), falls back to
-    the highest of the 3 input points.
+    Fits a parabola through (xp, yp).  Returns (x_peak, y_peak) at the vertex.
+    As in Matlab makeMap (09102026) there is no special case for a parabola
+    that opens upward: the vertex is returned regardless.
     """
     p = np.polyfit(xp, yp, 2)
-    if p[0] > 0:  # parabola opens up – pick the highest data point
-        ix = int(np.argmax(yp))
-        return float(xp[ix]), float(yp[ix])
     x_cen = -p[1] / (2.0 * p[0])
     y_cen = p[2] - p[1]**2 / (4.0 * p[0])
     return float(x_cen), float(y_cen)
 
 
 # ---------------------------------------------------------------------------
-# Multi-plane FITS cube writer  (new in 06032026, used by make_int_map)
+# Multi-plane FITS cube writer  (used by make_map)
 # ---------------------------------------------------------------------------
 
 def _write_int_map_cube(r, mapname, planes, baseline, order, intrange, reject):
     """
-    Write the 12-plane output FITS cube from make_int_map.
+    Write the 14-plane output FITS cube from make_map.
 
     Planes (each nx×ny) in order:
       1  integrated intensity     W/m2/sr
@@ -1164,12 +1361,14 @@ def _write_int_map_cube(r, mapname, planes, baseline, order, intrange, reject):
      10  Gaussian fit center err  µm
      11  Gaussian fit sigma       µm
      12  Gaussian fit sigma err   µm
+     13  continuum at line center MJy/sr
+     14  Gaussian fit flag from fit_lines
 
-    The spatial WCS is copied from the input cube dict r.  All 12 planes are
-    written as float32.  This matches the Matlab mkintmap output (NAXIS3=12).
+    The spatial WCS is copied from the input cube dict r.  All planes are
+    written as float32.  This matches the Matlab makeMap output (NAXIS3=14).
     """
     nx, ny = planes[0].shape
-    nplanes = len(planes)   # = 12
+    nplanes = len(planes)   # = 14
 
     # Stack (nx, ny, nplanes) → transpose to (nplanes, ny, nx) for FITS storage
     cube = np.stack(planes, axis=2).astype(np.float32)
@@ -1239,21 +1438,22 @@ def _write_int_map_cube(r, mapname, planes, baseline, order, intrange, reject):
     hdr['INTRNG'] = ' '.join(f'{v:.4f}' for v in intrange)
     hdr['CLIPLVL'] = reject
 
-    # COMMENT lines describing each plane (13 lines, matching Matlab)
+    # COMMENT lines describing each plane (14 lines, matching Matlab)
     for cmnt in [
         'PLANE 1 integrated intensity W/m2/sr',
         'PLANE 2 error in integrated intensity W/m2/sr',
-        'PLANE 3 peak intensity W/m2/sr',
-        'PLANE 4 baseline rms W/m2/sr',
+        'PLANE 3 peak intensity MJy/sr',
+        'PLANE 4 baseline rms MJy/sr',
         'PLANE 5 wave of peak intensity um',
-        'PLANE 6 pixels with clipped spectral data in sigma-clip',
+        'PLANE 6 pixels with clipped baseline data in sigma-clip',
         'PLANE 7 Gaussian fit area W/m2/sr',
         'PLANE 8 Gaussian fit area error W/m2/sr',
         'PLANE 9 Gaussian fit center um',
         'PLANE 10 Gaussian fit center error um',
         'PLANE 11 Gaussian fit sigma um',
         'PLANE 12 Gaussian fit sigma error um',
-        'PLANE 13 Gaussian fit flag from fitLines',
+        'PLANE 13 Continuum line ctr MJy/sr',
+        'PLANE 14 Gaussian fit flag from fitLines',
     ]:
         hdr['COMMENT'] = cmnt
 
@@ -1262,10 +1462,10 @@ def _write_int_map_cube(r, mapname, planes, baseline, order, intrange, reject):
 
 
 # ---------------------------------------------------------------------------
-# Integrated intensity map  (updated in 06032026)
+# Integrated intensity map  (makeMap, formerly mkintmap)
 # ---------------------------------------------------------------------------
 
-def make_int_map(fitsfile, mapname, baseline, order, intrange, flag=''):
+def make_map(fitsfile, mapname, baseline, order, intrange, flag=''):
     """
     Compute an integrated intensity map and its uncertainty.
 
@@ -1278,13 +1478,14 @@ def make_int_map(fitsfile, mapname, baseline, order, intrange, flag=''):
     order     : polynomial order for baseline fit
     intrange  : [l_start, l_end] integration range (microns)
     flag      : str – optional behavior flags (default ''):
-                'debug'       – print column progress and flag suspicious spectra
+                'debug'       – print column progress and typical RMS
                 'rejectX.X'  – sigma-clip baseline outliers at X.X sigma
                                (default reject=5 when 'reject' not in flag)
 
-    Writes {mapname}.fits — a 12-plane FITS cube containing all maps.
+    Writes {mapname}.fits — a 14-plane FITS cube containing all maps.
     Plane order: int, eint, peak, rms, wpeak, outliers, gm0, gem0, gm1, gem1,
-                 gm2, gem2 (see COMMENT keywords in output FITS header).
+                 gm2, gem2, cont, err (see COMMENT keywords in output FITS
+                 header).
 
     Returns
     -------
@@ -1301,6 +1502,7 @@ def make_int_map(fitsfile, mapname, baseline, order, intrange, flag=''):
         gem1      – uncertainty on gm1
         gm2       – per-pixel Gaussian sigma           (µm)
         gem2      – uncertainty on gm2
+        cont      – baseline (continuum) evaluated at wpeak (MJy/sr)
         err       – per-pixel Gaussian fit error flag
     """
     # Parse flag string
@@ -1335,7 +1537,8 @@ def make_int_map(fitsfile, mapname, baseline, order, intrange, flag=''):
     error_map     = np.zeros((nx, ny))
     pmap          = np.zeros((nx, ny))   # outlier flag map
     peak_map      = np.zeros((nx, ny))
-    rmsmap        = np.zeros((nx, ny))   # per-pixel baseline RMS (new in 06032026)
+    rmsmap        = np.zeros((nx, ny))   # per-pixel baseline RMS
+    cont          = np.zeros((nx, ny))   # baseline at the line peak
     wpeak_map     = np.zeros((nx, ny))
     m0map         = np.zeros((nx, ny))
     em0map        = np.zeros((nx, ny))
@@ -1364,7 +1567,7 @@ def make_int_map(fitsfile, mapname, baseline, order, intrange, flag=''):
                 basew = wv[ibs]
                 pcoef = np.polyfit(basew, sp[ibs], order)
                 spb = sp - np.polyval(pcoef, wv)
-                rms = np.std(spb[ibs])
+                rms = np.std(spb[ibs], ddof=1)   # Matlab std normalizes by N-1
                 if len(ibs) < order + 1:
                     break
                 if np.max(np.abs(spb[ibs])) > reject * rms:
@@ -1394,6 +1597,7 @@ def make_int_map(fitsfile, mapname, baseline, order, intrange, flag=''):
                     wp, pk = float(wv[iint[v_idx]]), v_amp
             else:
                 wp, pk = float(wv[iint[v_idx]]), v_amp
+            cont[i, j]      = np.polyval(pcoef, wp)   # in MJy/sr
             peak_map[i, j]  = pk
             wpeak_map[i, j] = wp
 
@@ -1415,21 +1619,15 @@ def make_int_map(fitsfile, mapname, baseline, order, intrange, flag=''):
 
             if debug:
                 rmsa[j] = rms
-                spb_uu = spb[uu]
-                if np.abs(np.min(spb_uu)) > 6 * rms:
-                    med_rms = float(np.nanmedian(rmsa[:j])) if j > 0 else np.nan
-                    print(f'  Row {j + 1} of {ny}: '
-                          f'Min={np.min(spb_uu):.3g}, rms={rms:.3g}, '
-                          f'typ.rms={med_rms:.3g}')
 
         if debug:
             print(f'  Typ. RMS={np.nanmedian(rmsa):.3g}')
 
-    # Write 12-plane FITS cube (matches Matlab mkintmap output, NAXIS3=12)
+    # Write 14-plane FITS cube (matches Matlab makeMap output, NAXIS3=14)
     _write_int_map_cube(
         r, mapname,
         planes=[intensity_map, error_map, peak_map, rmsmap, wpeak_map, pmap,
-                m0map, em0map, m1map, em1map, m2map, em2map],
+                m0map, em0map, m1map, em1map, m2map, em2map, cont, errmap],
         baseline=baseline, order=order, intrange=intrange, reject=reject,
     )
 
@@ -1446,8 +1644,13 @@ def make_int_map(fitsfile, mapname, baseline, order, intrange, flag=''):
         'gem1':     em1map,
         'gm2':      m2map,
         'gem2':     em2map,
+        'cont':     cont,
         'err':      errmap,
     }
+
+
+# Backward-compatible name (Matlab mkintmap was renamed makeMap)
+make_int_map = make_map
 
 
 # ---------------------------------------------------------------------------
@@ -1617,13 +1820,17 @@ def keep_lines(file, lst, tol=0.05):
 # ---------------------------------------------------------------------------
 
 def _parse_csv_catalog(fname):
-    """Read a simple 2-column LineName, RestValue CSV catalog."""
-    df = pd.read_csv(fname)
+    """Read a CSV catalog with 'Line Name' and 'Rest Value' columns and
+    an optional 'transition' column (e.g. HeI-HeII.csv)."""
+    df = pd.read_csv(fname, skipinitialspace=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    name_col = 'Line Name' if 'Line Name' in df.columns else df.columns[0]
+    rv_col = 'Rest Value' if 'Rest Value' in df.columns else df.columns[1]
     cat = {}
-    # First column = line name, second = rest wavelength
-    cols = df.columns.tolist()
-    cat['LineName'] = df[cols[0]].astype(str).tolist()
-    cat['RestValue'] = df[cols[1]].astype(float).values
+    cat['LineName'] = df[name_col].astype(str).str.strip().tolist()
+    cat['RestValue'] = pd.to_numeric(df[rv_col], errors='coerce').values
+    if 'transition' in df.columns:
+        cat['transition'] = df['transition'].astype(str).str.strip().tolist()
     return cat
 
 
@@ -1675,7 +1882,7 @@ def _parse_nist(fname):
     names = []
     rest_vals = []
     transitions = []
-    with open(fname, 'r') as fp:
+    with open(fname, 'r', encoding='latin-1') as fp:
         for _ in range(5):
             fp.readline()
         for ln in fp:
@@ -1822,11 +2029,14 @@ def line_id(linefile, vlsr, R=250, outname=None, catdir=None):
                     })
 
             if matches:
-                # Prefer non-H2 vibrational transitions at top
-                matches_sorted = sorted(matches, key=lambda m: abs(m['dd']))
-                h2vib = [m for m in matches_sorted if 'H2 v=' in m['name']]
-                other = [m for m in matches_sorted if 'H2 v=' not in m['name']]
-                ordered = other + h2vib
+                # Random OH or H2 vibrational transitions are unlikely: while
+                # one is at the top, rotate it to the bottom (Matlab circshift)
+                ordered = sorted(matches, key=lambda m: abs(m['dd']))
+                for _ in range(len(ordered)):
+                    if not ('H2 v=' in ordered[0]['name']
+                            or 'OH ' in ordered[0]['name']):
+                        break
+                    ordered = ordered[1:] + ordered[:1]
 
                 for j, m in enumerate(ordered):
                     vel = m['dd'] / m['rv'] * clight
@@ -1880,7 +2090,10 @@ def plot_peaks(file, idfile=None, yrange=None, color=None):
     Parameters
     ----------
     file    : str – base name
-    idfile  : str or False, optional – lineID file; auto-detected if None
+    idfile  : str or False, optional – lineID file; auto-detected if None.
+              An empty string means no line IDs.  As in Matlab plotPeaks, a
+              numeric value here is taken as yrange (and then a third
+              argument, if given, as color).
     yrange  : [ymin, ymax] for vertical peak markers
     color   : matplotlib colour string for the spectrum
 
@@ -1889,7 +2102,13 @@ def plot_peaks(file, idfile=None, yrange=None, color=None):
     hh : matplotlib Line2D handle
     spx, spy : spectrum wavelength and intensity arrays
     """
-    if idfile is None and os.path.exists(f'{file}-lineID.txt'):
+    if idfile is not None and not isinstance(idfile, (str, bool)):
+        # plot_peaks(file, yrange[, color]): shift arguments as in Matlab
+        if yrange is not None:
+            color = yrange
+        yrange = idfile
+        idfile = False
+    elif idfile is None and os.path.exists(f'{file}-lineID.txt'):
         idfile = f'{file}-lineID.txt'
 
     spec_data = np.loadtxt(f'{file}_spec.txt', comments='%')
@@ -1918,7 +2137,11 @@ def plot_peaks(file, idfile=None, yrange=None, color=None):
 
     # Load line IDs if available
     ids = []
-    if isinstance(idfile, str) and os.path.exists(idfile):
+    if isinstance(idfile, str) and idfile:
+        if '.txt' not in idfile:
+            idfile = f'{idfile}.txt'
+        if not os.path.exists(idfile):
+            raise FileNotFoundError('line ID file not found')
         with open(idfile, 'r') as fp:
             for ln in fp:
                 if 'BEST:' in ln:
@@ -1940,7 +2163,7 @@ def plot_peaks(file, idfile=None, yrange=None, color=None):
 
         # Vertical marker
         if do_range:
-            ax.axvline(wvi, ymin=0, ymax=1, color='r', linestyle='-.')
+            ax.plot([wvi, wvi], yrange, 'r-.')
         else:
             ylo = 10**int(np.log10(max(np.min(spy[spy > 0]), 1e-30)))
             ax.plot([wvi, wvi], [ylo, np.max(spy)], 'r-.')
@@ -1951,7 +2174,13 @@ def plot_peaks(file, idfile=None, yrange=None, color=None):
         ax.text(wvi, ty, str(line_no), ha='center', va='top', fontsize=14)
 
         if ids and i < len(ids) and ids[i] != '?':
-            species = ids[i].split()[0]
+            tok = ids[i].split()
+            species = tok[0]
+            try:   # numeric first token: join the first two (Matlab sscanf '%s',2)
+                float(species)
+                species = ''.join(tok[:2])
+            except ValueError:
+                pass
             ax.text(wvi, ty * 0.7, species, ha='center', va='top', fontsize=14)
 
     ax.set_xlabel('Wavelength (um)')
@@ -2039,3 +2268,88 @@ def read_model(file):
                 except ValueError:
                     cols[j].append(np.nan)
     return [np.array(c) for c in cols if c]
+
+
+# ---------------------------------------------------------------------------
+# Differential spectrum  (new in 10222026)
+# ---------------------------------------------------------------------------
+
+def _match_lengths(u, ref):
+    """Interpolate the spectrum u (cols wave, value) onto the wavelengths of ref."""
+    out = ref.copy()
+    out[:, 1] = np.interp(ref[:, 0], u[:, 0], u[:, 1], left=np.nan, right=np.nan)
+    return out
+
+
+def diff_spec(cuben, pka, ch, src, R, linelist, vlsr, outdir=''):
+    """
+    Produce a differential spectrum by removing an annulus from the central
+    position.  Port of Matlab diffSpec.m.
+
+    Parameters
+    ----------
+    cuben    : cube filename with '?' in place of the channel number
+    pka      : list of (RA, Dec) sexagesimal strings
+    ch       : channel (1-4)
+    src      : source number in pka (1-based)
+    R        : 3x4 array of radii (arcsec): row 1 central aperture, row 2
+               inner and row 3 outer radius of the annulus; column = channel
+    linelist : list of wavelengths for likely lines (passed to cat_peaks)
+    vlsr     : velocity of the source (km/s), for line_id
+    outdir   : directory for the output files (default current directory)
+
+    Writes pk{src}-ch{ch}* (central aperture, with line IDs),
+    pk{src}bg1-ch{ch}*, pk{src}bg2-ch{ch}* (cat_peaks products),
+    pk{src}-ch{ch}_diffspec.txt and pk{src}-ch{ch}_diffspec.png.
+
+    Returns
+    -------
+    dss : (N, 3) array; columns are wavelength, differential spectrum,
+          spectrum of the center
+    """
+    cube = read_fits(cuben.replace('?', str(ch)), 'xten1')
+    name = os.path.join(outdir, f'pk{src}-ch{ch}')
+    namebg1 = os.path.join(outdir, f'pk{src}bg1-ch{ch}')
+    namebg2 = os.path.join(outdir, f'pk{src}bg2-ch{ch}')
+    R = np.asarray(R, dtype=float)
+    Ro = R[0, ch - 1]   # radius of central aperture
+    R1 = R[1, ch - 1]   # inner radius of annulus
+    R2 = R[2, ch - 1]   # outer radius of annulus
+    ra, dec = pka[src - 1][0], pka[src - 1][1]
+    cat_peaks(cube, name, pixco=(ra, dec, Ro), snr=1, linelist=linelist)
+    cat_peaks(cube, namebg1, pixco=(ra, dec, R1), snr=10)
+    cat_peaks(cube, namebg2, pixco=(ra, dec, R2), snr=10)
+    u1 = np.loadtxt(namebg1 + '_spec.txt', comments='%')   # produced by cat_peaks
+    u2 = np.loadtxt(namebg2 + '_spec.txt', comments='%')
+    u3 = np.loadtxt(name + '_spec.txt', comments='%')
+    # Sometimes there are length mismatches because of edge pixels
+    if len(u2) < len(u1):
+        u1 = _match_lengths(u1, u2)
+    elif len(u1) < len(u2):
+        u2 = _match_lengths(u2, u1)
+    if len(u3) < len(u1):
+        u1 = _match_lengths(u1, u3)
+        u2 = _match_lengths(u2, u3)
+    elif len(u1) < len(u3):
+        u3 = _match_lengths(u3, u1)
+
+    line_id(name, vlsr)
+    hh, _, _ = plot_peaks(name)
+    ax = hh.axes
+    ax.set_yscale('log')
+    # The math for u1 and u2 corrects for the fact that cat_peaks returned the
+    # spectrum in circular apertures of radii R1, R2
+    ds = u3[:, 1] - (u1[:, 1] * R1**2 - u2[:, 1] * R2**2) / (R1**2 - R2**2)
+    ofst = 0
+    while np.sum(ds + ofst < 0) > 0.01 * len(ds):
+        ofst += 5
+        print(f'Offseting by {ofst:f} for display')
+    ax.plot(u3[:, 0], ds + ofst, linewidth=2)
+    ax.figure.savefig(name + '_diffspec.png', dpi=100, bbox_inches='tight')
+    plt.close(ax.figure)
+
+    dss = np.column_stack([u3[:, 0], ds, u3[:, 1]])
+    with open(name + '_diffspec.txt', 'w') as fp:
+        for row in dss:
+            fp.write(f'{row[0]:8.5f} {row[1]:8.5e} {row[2]:8.5e}\n')
+    return dss
