@@ -1045,6 +1045,30 @@ def fit_lines(wv, spec, peaks):
 # Main cataloguing function
 # ---------------------------------------------------------------------------
 
+def _read_table_spectrum(fname, ext):
+    """
+    Read a spectrum from the ext-th binary-table extension of a FITS file,
+    mirroring Matlab fitsread(fname,'binarytable',ext) as used in catPeaks:
+    wavelength from column 1, spectrum from column 4.
+
+    Returns (r, s) where r is a minimal rfits-like dict (x[2], bunit) and s
+    the spectrum.
+    """
+    if not isinstance(fname, str):
+        raise ValueError("pixco=('table', N) requires fname to be a filename.")
+    with fits.open(fname) as hdulist:
+        tabs = [h for h in hdulist if isinstance(h, fits.BinTableHDU)]
+        if ext < 1 or ext > len(tabs):
+            raise ValueError(f'{fname} has {len(tabs)} binary table(s); '
+                             f'extension {ext} requested.')
+        tab = tabs[ext - 1]
+        wv = np.asarray(tab.data.field(0), dtype=float).ravel()
+        s = np.asarray(tab.data.field(3), dtype=float).ravel()
+        bunit = tab.header.get('TUNIT4', '')
+    r = {'x': [None, None, wv], 'bunit': bunit}
+    return r, s
+
+
 def cat_peaks(fname, outname, pixco=0, snr=5, linelist=None, nchunk=1):
     """
     Create a catalog of significant Gaussian peaks for a spectrum extracted
@@ -1061,7 +1085,10 @@ def cat_peaks(fname, outname, pixco=0, snr=5, linelist=None, nchunk=1):
     ----------
     fname   : str or dict – FITS filename or pre-loaded rfits dict
     outname : str – base name for output files (may include path)
-    pixco   : extraction region (see extract_aperture); default 0 = whole cube
+    pixco   : extraction region (see extract_aperture); default 0 = whole cube.
+              If ('table', N), fname is opened as a FITS binary table using
+              the N-th binary-table extension: column 1 is the wavelength and
+              column 4 the spectrum (fname must then be a filename).
     snr     : minimum S/N for peak detection (default 5)
     linelist: optional approximate wavelengths (um) of the acceptable lines
               (default None = accept all peaks).  Detected peaks are kept
@@ -1077,7 +1104,15 @@ def cat_peaks(fname, outname, pixco=0, snr=5, linelist=None, nchunk=1):
     q : dict with Gaussian fit results (same fields as fit_lines output)
         q['flag'] is set to the extraction flag if extraction failed.
     """
-    if isinstance(fname, str):
+    # A 2-element list ('table', N) means fname is a FITS binary table
+    # (e.g. a 1-D extracted spectrum): wavelength from column 1, flux from column 4
+    is_table = (isinstance(pixco, (list, tuple)) and len(pixco) == 2
+                and isinstance(pixco[0], str) and pixco[0] == 'table')
+
+    if is_table:
+        r, s = _read_table_spectrum(fname, int(pixco[1]))
+        region = 'table'
+    elif isinstance(fname, str):
         r = read_fits(fname, 'xten1')
     else:
         r = fname
@@ -1093,9 +1128,10 @@ def cat_peaks(fname, outname, pixco=0, snr=5, linelist=None, nchunk=1):
     # Threshold scale: divide by 1.5 to convert Gaussian sigma to MAD
     snr_scaled = snr / 1.5
 
-    s, region, mask, flag = extract_aperture(r, pixco)
-    if flag != 0:
-        return {'flag': flag}
+    if not is_table:
+        s, region, mask, flag = extract_aperture(r, pixco)
+        if flag != 0:
+            return {'flag': flag}
 
     wv_all = r['x'][2]
     valid = ~np.isnan(s)
