@@ -26,9 +26,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# Default catalog directory
-_CATDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       '..', 'matlab_slice_09102026')
+# Default catalog directory: line catalogs live alongside this module
+_CATDIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ---------------------------------------------------------------------------
@@ -1967,7 +1966,7 @@ def line_id(linefile, vlsr, R=250, outname=None, catdir=None):
     outname  : str, optional
         Output filename (default: {linefile}-lineID.txt).
     catdir   : str, optional
-        Directory containing catalog files (default: matlab_slice_06012026/).
+        Directory containing catalog files (default: this module's directory).
     """
     clight = 3e5   # km/s
 
